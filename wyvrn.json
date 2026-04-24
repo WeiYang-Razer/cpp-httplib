@@ -1,0 +1,21 @@
+{
+  "name": "cpp-httplib",
+  "version": "0.0.0.0",
+  "schemaVersion": 2,
+  "kind": "HeaderOnlyLib",
+  "description": "TODO: one-line description of cpp-httplib",
+  "dependencies": {},
+  "build": {
+    "system": "cmake",
+    "configs": [
+      "Debug",
+      "Release",
+      "RelWithDebInfo",
+      "MinSizeRel"
+    ],
+    "configure": [
+      "-DHTTPLIB_TEST=OFF"
+    ],
+    "installDir": "install"
+  }
+}
