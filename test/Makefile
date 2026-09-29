@@ -1,5 +1,5 @@
 CXX = clang++
-CXXFLAGS = -g -std=c++11 -I. -Wall -Wextra -Wtype-limits -Wconversion -Wshadow $(EXTRA_CXXFLAGS) -DCPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO -fsanitize=address # -fno-exceptions -DCPPHTTPLIB_NO_EXCEPTIONS
+CXXFLAGS = -g -std=c++11 -I. -Wall -Wextra -Wtype-limits -Wconversion -Wshadow -DCPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO -fsanitize=address $(EXTRA_CXXFLAGS) # -fno-exceptions -DCPPHTTPLIB_NO_EXCEPTIONS
 
 ifneq ($(OS), Windows_NT)
 	UNAME_S := $(shell uname -s)
@@ -8,8 +8,11 @@ ifneq ($(OS), Windows_NT)
 		OPENSSL_DIR = $(PREFIX)/opt/openssl@3
 		OPENSSL_SUPPORT = -DCPPHTTPLIB_OPENSSL_SUPPORT -I$(OPENSSL_DIR)/include -L$(OPENSSL_DIR)/lib -lssl -lcrypto
 		OPENSSL_SUPPORT += -framework CoreFoundation -framework Security
-		MBEDTLS_DIR ?= $(shell brew --prefix mbedtls@3)
-		MBEDTLS_SUPPORT = -DCPPHTTPLIB_MBEDTLS_SUPPORT -I$(MBEDTLS_DIR)/include -L$(MBEDTLS_DIR)/lib -lmbedtls -lmbedx509 -lmbedcrypto
+		# Homebrew's default mbedtls is 4.x; override MBEDTLS_DIR for other versions.
+		MBEDTLS_DIR ?= $(shell brew --prefix mbedtls)
+		# Mbed TLS 4.x renamed libmbedcrypto to libtfpsacrypto; pick whichever exists.
+		MBEDTLS_CRYPTO_LIB ?= $(shell test -f "$(MBEDTLS_DIR)/lib/libtfpsacrypto.dylib" -o -f "$(MBEDTLS_DIR)/lib/libtfpsacrypto.a" && echo tfpsacrypto || echo mbedcrypto)
+		MBEDTLS_SUPPORT = -DCPPHTTPLIB_MBEDTLS_SUPPORT -I$(MBEDTLS_DIR)/include -L$(MBEDTLS_DIR)/lib -lmbedtls -lmbedx509 -l$(MBEDTLS_CRYPTO_LIB)
 		MBEDTLS_SUPPORT += -framework CoreFoundation -framework Security
 		WOLFSSL_DIR ?= $(shell brew --prefix wolfssl)
 		WOLFSSL_SUPPORT = -DCPPHTTPLIB_WOLFSSL_SUPPORT -I$(WOLFSSL_DIR)/include -I$(WOLFSSL_DIR)/include/wolfssl -L$(WOLFSSL_DIR)/lib -lwolfssl
@@ -18,8 +21,10 @@ ifneq ($(OS), Windows_NT)
 		OPENSSL_SUPPORT = -DCPPHTTPLIB_OPENSSL_SUPPORT -lssl -lcrypto
 		MBEDTLS_SUPPORT = -DCPPHTTPLIB_MBEDTLS_SUPPORT -lmbedtls -lmbedx509 -lmbedcrypto
 		WOLFSSL_SUPPORT = -DCPPHTTPLIB_WOLFSSL_SUPPORT -lwolfssl
-		# Disable ASLR for ASAN compatibility on WSL2 (high-entropy ASLR conflicts with ASAN shadow memory)
-		SETARCH = setarch $(shell uname -m) -R
+		ifeq ($(UNAME_S), Linux)
+			# Disable ASLR for ASAN compatibility on WSL2 (high-entropy ASLR conflicts with ASAN shadow memory)
+			SETARCH = setarch $(shell uname -m) -R
+		endif
 	endif
 endif
 
@@ -67,22 +72,29 @@ SHARDS ?= 4
 
 define run_parallel
 	@echo "Running $(1) with $(SHARDS) shards in parallel..."
-	@fail=0; \
+	@fail=0; pids=""; \
 	for i in $$(seq 0 $$(($(SHARDS) - 1))); do \
 	  GTEST_TOTAL_SHARDS=$(SHARDS) GTEST_SHARD_INDEX=$$i \
 	  LSAN_OPTIONS=suppressions=lsan_suppressions.txt \
 	  $(SETARCH) ./$(1) --gtest_color=yes > $(1)_shard_$$i.log 2>&1 & \
+	  pids="$$pids $$!"; \
 	done; \
-	wait; \
-	for i in $$(seq 0 $$(($(SHARDS) - 1))); do \
-	  if ! grep -q "\[  PASSED  \]" $(1)_shard_$$i.log; then \
-	    echo "=== Shard $$i FAILED ==="; \
-	    cat $(1)_shard_$$i.log; \
-	    fail=1; \
-	  else \
-	    passed=$$(grep "\[  PASSED  \]" $(1)_shard_$$i.log); \
+	exits=""; \
+	for pid in $$pids; do \
+	  wait $$pid; exits="$$exits $$?"; \
+	done; \
+	i=0; \
+	for ec in $$exits; do \
+	  log=$(1)_shard_$$i.log; \
+	  if grep -q "\[  PASSED  \]" $$log && ! grep -q "\[  FAILED  \]" $$log && [ $$ec -eq 0 ]; then \
+	    passed=$$(grep "\[  PASSED  \]" $$log); \
 	    echo "Shard $$i: $$passed"; \
+	  else \
+	    echo "=== Shard $$i FAILED (exit=$$ec) ==="; \
+	    cat $$log; \
+	    fail=1; \
 	  fi; \
+	  i=$$((i+1)); \
 	done; \
 	if [ $$fail -ne 0 ]; then exit 1; fi; \
 	echo "All shards passed."
@@ -193,8 +205,25 @@ test_split_no_tls : test.cc ../httplib.h httplib.cc Makefile
 	$(CXX) -o $@ $(CXXFLAGS) test.cc httplib.cc $(TEST_ARGS_NO_TLS)
 
 # ThreadPool unit tests (no TLS, no compression needed)
+#
+# The constructor-exception-safety reproducer test interposes pthread_create
+# at link time. The link flags below enable that interposition. ASAN is also
+# stripped from this target because libasan installs its own pthread_create
+# interceptor; layering our override on top corrupts ASAN's thread bookkeeping
+# and trips "Joining already joined thread" on Linux. ThreadPool memory
+# behavior is still covered by the ASAN-instrumented `test` binary.
+ifneq ($(OS), Windows_NT)
+ifeq ($(shell uname -s), Darwin)
+THREAD_POOL_INTERPOSE_LDFLAGS := -Wl,-flat_namespace
+else
+THREAD_POOL_INTERPOSE_LDFLAGS := -Wl,--export-dynamic
+endif
+endif
+
+THREAD_POOL_CXXFLAGS := $(filter-out -fsanitize=address,$(CXXFLAGS))
+
 test_thread_pool : test_thread_pool.cc ../httplib.h Makefile
-	$(CXX) -o $@ -I.. $(CXXFLAGS) test_thread_pool.cc gtest/src/gtest-all.cc gtest/src/gtest_main.cc -Igtest -Igtest/include -lpthread
+	$(CXX) -o $@ -I.. $(THREAD_POOL_CXXFLAGS) test_thread_pool.cc gtest/src/gtest-all.cc gtest/src/gtest_main.cc -Igtest -Igtest/include -lpthread $(THREAD_POOL_INTERPOSE_LDFLAGS)
 
 check_abi:
 	@./check-shared-library-abi-compatibility.sh
@@ -235,6 +264,10 @@ test_websocket_heartbeat : test_websocket_heartbeat.cc ../httplib.h Makefile
 	$(CXX) -o $@ -I.. $(CXXFLAGS) test_websocket_heartbeat.cc $(TEST_ARGS)
 	@file $@
 
+test_websocket_thread_safety : test_websocket_thread_safety.cc ../httplib.h Makefile cert.pem
+	$(CXX) -o $@ -I.. $(CXXFLAGS) test_websocket_thread_safety.cc $(TEST_ARGS)
+	@file $@
+
 test_proxy : test_proxy.cc ../httplib.h Makefile cert.pem
 	$(CXX) -o $@ -I.. $(CXXFLAGS) test_proxy.cc $(TEST_ARGS)
 
@@ -244,13 +277,35 @@ test_proxy_mbedtls : test_proxy.cc ../httplib.h Makefile cert.pem
 test_proxy_wolfssl : test_proxy.cc ../httplib.h Makefile cert.pem
 	$(CXX) -o $@ -I.. $(CXXFLAGS) test_proxy.cc $(TEST_ARGS_WOLFSSL)
 
-# Runs server_fuzzer.cc based on value of $(LIB_FUZZING_ENGINE).
-# Usage: make fuzz_test LIB_FUZZING_ENGINE=/path/to/libFuzzer
-fuzz_test: server_fuzzer
-	./server_fuzzer fuzzing/corpus/*
+# Runs all fuzz harnesses based on the value of $(LIB_FUZZING_ENGINE).
+# By default LIB_FUZZING_ENGINE is standalone_fuzz_target_runner.o, so each
+# fuzzer is replayed over its regression corpus.
+# Override for actual fuzzing:
+#   make fuzz_test LIB_FUZZING_ENGINE=/path/to/libFuzzer
+fuzz_test: server_fuzzer client_fuzzer header_parser_fuzzer url_parser_fuzzer
+	@m=""; for f in fuzzing/corpus/[0-9]* fuzzing/corpus/issue1264 fuzzing/corpus/clusterfuzz-testcase-minimized-server_fuzzer-*; do if [ -f "$$f" ]; then m="$$m $$f"; fi; done; \
+	if [ -n "$$m" ]; then echo "./server_fuzzer$$m"; ./server_fuzzer $$m; else echo "(no server_fuzzer corpus)"; fi
+	@m=""; for f in fuzzing/corpus/clusterfuzz-testcase-minimized-client_fuzzer-*; do if [ -f "$$f" ]; then m="$$m $$f"; fi; done; \
+	if [ -n "$$m" ]; then echo "./client_fuzzer$$m"; ./client_fuzzer $$m; else echo "(no client_fuzzer corpus)"; fi
+	@m=""; for f in fuzzing/corpus/clusterfuzz-testcase-minimized-header_parser_fuzzer-*; do if [ -f "$$f" ]; then m="$$m $$f"; fi; done; \
+	if [ -n "$$m" ]; then echo "./header_parser_fuzzer$$m"; ./header_parser_fuzzer $$m; else echo "(no header_parser_fuzzer corpus)"; fi
+	@m=""; for f in fuzzing/corpus/clusterfuzz-testcase-minimized-url_parser_fuzzer-*; do if [ -f "$$f" ]; then m="$$m $$f"; fi; done; \
+	if [ -n "$$m" ]; then echo "./url_parser_fuzzer$$m"; ./url_parser_fuzzer $$m; else echo "(no url_parser_fuzzer corpus)"; fi
 
 # Fuzz target, so that you can choose which $(LIB_FUZZING_ENGINE) to use.
 server_fuzzer : fuzzing/server_fuzzer.cc ../httplib.h standalone_fuzz_target_runner.o
+	$(CXX) -o $@ -I.. $(CXXFLAGS) $< $(OPENSSL_SUPPORT) $(ZLIB_SUPPORT) $(BROTLI_SUPPORT) $(LIB_FUZZING_ENGINE) $(ZSTD_SUPPORT) $(LIBS)
+	@file $@
+
+client_fuzzer : fuzzing/client_fuzzer.cc ../httplib.h standalone_fuzz_target_runner.o
+	$(CXX) -o $@ -I.. $(CXXFLAGS) $< $(OPENSSL_SUPPORT) $(ZLIB_SUPPORT) $(BROTLI_SUPPORT) $(LIB_FUZZING_ENGINE) $(ZSTD_SUPPORT) $(LIBS)
+	@file $@
+
+header_parser_fuzzer : fuzzing/header_parser_fuzzer.cc ../httplib.h standalone_fuzz_target_runner.o
+	$(CXX) -o $@ -I.. $(CXXFLAGS) $< $(OPENSSL_SUPPORT) $(ZLIB_SUPPORT) $(BROTLI_SUPPORT) $(LIB_FUZZING_ENGINE) $(ZSTD_SUPPORT) $(LIBS)
+	@file $@
+
+url_parser_fuzzer : fuzzing/url_parser_fuzzer.cc ../httplib.h standalone_fuzz_target_runner.o
 	$(CXX) -o $@ -I.. $(CXXFLAGS) $< $(OPENSSL_SUPPORT) $(ZLIB_SUPPORT) $(BROTLI_SUPPORT) $(LIB_FUZZING_ENGINE) $(ZSTD_SUPPORT) $(LIBS)
 	@file $@
 
@@ -266,5 +321,5 @@ cert.pem:
 	./gen-certs.sh
 
 clean:
-	rm -rf test test_split test_mbedtls test_split_mbedtls test_wolfssl test_split_wolfssl test_no_tls, test_split_no_tls test_proxy test_proxy_mbedtls test_proxy_wolfssl test_benchmark server_fuzzer *.pem *.0 *.o *.1 *.srl httplib.h httplib.cc _build* *.dSYM *_shard_*.log cpp-httplib
+	rm -rf test test_split test_mbedtls test_split_mbedtls test_wolfssl test_split_wolfssl test_no_tls, test_split_no_tls test_proxy test_proxy_mbedtls test_proxy_wolfssl test_benchmark server_fuzzer client_fuzzer header_parser_fuzzer url_parser_fuzzer *.pem *.0 *.o *.1 *.srl httplib.h httplib.cc _build* *.dSYM *_shard_*.log cpp-httplib
 

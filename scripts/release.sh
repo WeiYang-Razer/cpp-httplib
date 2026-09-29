@@ -2,10 +2,12 @@
 #
 # Release a new version of cpp-httplib.
 #
-# Usage: ./release.sh [--run]
+# Usage: ./release.sh [--run] [--minor]
 #
 # By default, runs in dry-run mode (no changes made).
 # Pass --run to actually update files, commit, tag, and push.
+# Pass --minor to force a minor bump even when ABI is unchanged
+# (use this for behavioral breaking changes that don't break ABI).
 #
 # This script:
 #   1. Reads the current version from httplib.h
@@ -14,21 +16,30 @@
 #   4. Determines the next version automatically:
 #        - abidiff passed  → patch bump (e.g., 0.38.0 → 0.38.1)
 #        - abidiff failed  → minor bump (e.g., 0.38.1 → 0.39.0)
+#        - --minor passed  → forces minor bump regardless of abidiff
 #   5. Updates httplib.h and docs-src/config.toml
 #   6. Commits, tags (vX.Y.Z), and pushes
 
 set -euo pipefail
 
 DRY_RUN=1
-if [ "${1:-}" = "--run" ]; then
-  DRY_RUN=0
-  shift
-fi
-
-if [ $# -ne 0 ]; then
-  echo "Usage: $0 [--run]"
-  exit 1
-fi
+FORCE_MINOR=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run)
+      DRY_RUN=0
+      shift
+      ;;
+    --minor)
+      FORCE_MINOR=1
+      shift
+      ;;
+    *)
+      echo "Usage: $0 [--run] [--minor]"
+      exit 1
+      ;;
+  esac
+done
 
 # --- Step 1: Read current version from httplib.h ---
 CURRENT_VERSION=$(sed -n 's/^#define CPPHTTPLIB_VERSION "\([^"]*\)"/\1/p' httplib.h)
@@ -51,8 +62,7 @@ HEAD_SHORT=$(git rev-parse --short HEAD)
 echo "    Latest commit: $HEAD_SHORT"
 
 # Fetch all workflow runs for the HEAD commit
-RUNS=$(gh run list --json name,conclusion,headSha \
-  --jq "[.[] | select(.headSha == \"$HEAD_SHA\")]")
+RUNS=$(gh run list --commit "$HEAD_SHA" --json name,status,conclusion,headSha)
 
 NUM_RUNS=$(echo "$RUNS" | jq 'length')
 
@@ -65,8 +75,17 @@ fi
 echo "    Found $NUM_RUNS workflow run(s):"
 
 FAILED=0
+RUNNING=0
 ABIDIFF_PASSED=0
-while IFS=$'\t' read -r name conclusion; do
+while IFS=$'\t' read -r name status conclusion; do
+  # A run that hasn't completed yet has an empty conclusion; don't treat it
+  # as a failure — the release should wait until CI finishes.
+  if [ "$status" != "completed" ]; then
+    echo "      [ .. ] $name (still running)"
+    RUNNING=1
+    continue
+  fi
+
   if [[ "$name" == *abidiff* ]] || [[ "$name" == *abi* && "$name" != *stability* ]]; then
     if [ "$conclusion" = "success" ]; then
       echo "      [ OK ] $name"
@@ -84,7 +103,13 @@ while IFS=$'\t' read -r name conclusion; do
     echo "      [FAIL] $name ($conclusion)"
     FAILED=1
   fi
-done < <(echo "$RUNS" | jq -r '.[] | [.name, .conclusion] | @tsv')
+done < <(echo "$RUNS" | jq -r '.[] | [.name, .status, .conclusion] | @tsv')
+
+if [ "$RUNNING" -eq 1 ]; then
+  echo ""
+  echo "Error: Some CI checks are still running. Wait for them to complete before releasing."
+  exit 1
+fi
 
 if [ "$FAILED" -eq 1 ]; then
   echo ""
@@ -95,7 +120,12 @@ fi
 echo "    All non-abidiff CI checks passed."
 
 # --- Step 4: Determine new version ---
-if [ "$ABIDIFF_PASSED" -eq 1 ]; then
+if [ "$FORCE_MINOR" -eq 1 ] && [ "$ABIDIFF_PASSED" -eq 1 ]; then
+  NEW_MINOR=$((V_MINOR + 1))
+  NEW_VERSION="$V_MAJOR.$NEW_MINOR.0"
+  echo ""
+  echo "==> abidiff passed but --minor specified → forced minor bump"
+elif [ "$ABIDIFF_PASSED" -eq 1 ]; then
   NEW_PATCH=$((V_PATCH + 1))
   NEW_VERSION="$V_MAJOR.$V_MINOR.$NEW_PATCH"
   echo ""
@@ -104,7 +134,11 @@ else
   NEW_MINOR=$((V_MINOR + 1))
   NEW_VERSION="$V_MAJOR.$NEW_MINOR.0"
   echo ""
-  echo "==> abidiff failed → minor bump"
+  if [ "$FORCE_MINOR" -eq 1 ]; then
+    echo "==> abidiff failed → minor bump (--minor also specified)"
+  else
+    echo "==> abidiff failed → minor bump"
+  fi
 fi
 
 VERSION_HEX=$(printf "0x%02x%02x%02x" "${NEW_VERSION%%.*}" "$(echo "$NEW_VERSION" | cut -d. -f2)" "${NEW_VERSION##*.}")
@@ -130,14 +164,18 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "==> Dry run complete. No changes were made."
 else
   echo "==> Updating httplib.h..."
-  sed -i '' "s/#define CPPHTTPLIB_VERSION \"[^\"]*\"/#define CPPHTTPLIB_VERSION \"$NEW_VERSION\"/" httplib.h
-  sed -i '' "s/#define CPPHTTPLIB_VERSION_NUM \"0x[0-9a-fA-F]*\"/#define CPPHTTPLIB_VERSION_NUM \"$VERSION_HEX\"/" httplib.h
+  # `-i.bak` is the in-place form GNU and BSD sed both accept (`-i ''` is
+  # BSD-only: GNU sed reads the '' as the script).
+  sed -i.bak "s/#define CPPHTTPLIB_VERSION \"[^\"]*\"/#define CPPHTTPLIB_VERSION \"$NEW_VERSION\"/" httplib.h
+  sed -i.bak "s/#define CPPHTTPLIB_VERSION_NUM \"0x[0-9a-fA-F]*\"/#define CPPHTTPLIB_VERSION_NUM \"$VERSION_HEX\"/" httplib.h
+  rm -f httplib.h.bak
   echo "    CPPHTTPLIB_VERSION     = \"$NEW_VERSION\""
   echo "    CPPHTTPLIB_VERSION_NUM = \"$VERSION_HEX\""
 
   echo ""
   echo "==> Updating docs-src/config.toml..."
-  sed -i '' "s/^version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" docs-src/config.toml
+  sed -i.bak "s/^version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" docs-src/config.toml
+  rm -f docs-src/config.toml.bak
   echo "    version = \"$NEW_VERSION\""
 
   # --- Step 6: Commit, tag, and push ---
