@@ -137,6 +137,35 @@ cert_ipv6_pem = custom_target(
   command: [openssl, 'req', '-x509', '-key', '@INPUT@', '-sha256', '-days', '3650', '-nodes', '-subj', '/CN=::1', '-addext', 'subjectAltName=IP:2001:db8::1', '-out', '@OUTPUT@']
 )
 
+# cert_san_types.pem: the bytes of each SAN read as the other type: DNS:a.zz is
+# 97.46.122.122, IP:42.46.122.122 is "*.zz".
+cert_san_types_pem = custom_target(
+  'cert_san_types_pem',
+  input: key_pem,
+  output: 'cert_san_types.pem',
+  command: [openssl, 'req', '-x509', '-key', '@INPUT@', '-sha256', '-days', '3650', '-nodes', '-subj', '/CN=san-types', '-addext', 'subjectAltName=DNS:a.zz,IP:42.46.122.122', '-out', '@OUTPUT@']
+)
+
+# cert_dns_cn.pem: CN is the DNS name the tests connect to, with NO
+# subjectAltName. A host is named by a SAN only (RFC 9525), so verifying it
+# against this cert must fail.
+cert_dns_cn_pem = custom_target(
+  'cert_dns_cn_pem',
+  input: key_pem,
+  output: 'cert_dns_cn.pem',
+  command: [openssl, 'req', '-x509', '-key', '@INPUT@', '-sha256', '-days', '3650', '-nodes', '-subj', '/CN=localhost', '-out', '@OUTPUT@']
+)
+
+# cert_wildcard_san.pem: a leftmost wildcard next to one that is not leftmost.
+# "*.leftmost.example.test" matches a single label; the wildcard in
+# "www.*.example.test" must not be honoured.
+cert_wildcard_san_pem = custom_target(
+  'cert_wildcard_san_pem',
+  input: key_pem,
+  output: 'cert_wildcard_san.pem',
+  command: [openssl, 'req', '-x509', '-key', '@INPUT@', '-sha256', '-days', '3650', '-nodes', '-subj', '/CN=wildcard-san', '-addext', 'subjectAltName=DNS:*.leftmost.example.test,DNS:www.*.example.test', '-out', '@OUTPUT@']
+)
+
 # Copy test files to the build directory
 configure_file(input: 'ca-bundle.crt', output: 'ca-bundle.crt', copy: true)
 configure_file(input: 'image.jpg',     output: 'image.jpg',     copy: true)
@@ -178,7 +207,10 @@ test(
     client_encrypted_pbes1_key_pem,
     client_encrypted_cert_pem,
     cert_ip_cn_pem,
-    cert_ipv6_pem
+    cert_dns_cn_pem,
+    cert_ipv6_pem,
+    cert_san_types_pem,
+    cert_wildcard_san_pem
   ],
   workdir: meson.current_build_dir(),
   timeout: 300

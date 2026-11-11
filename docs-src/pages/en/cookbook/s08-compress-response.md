@@ -32,7 +32,7 @@ That's it. If the client sent `Accept-Encoding: gzip`, cpp-httplib compresses th
 
 ## Encoding priority
 
-When the client accepts multiple encodings, cpp-httplib picks in this order (among those enabled at build time): Brotli → Zstd → gzip. Your code doesn't need to care — you always get the most efficient option available.
+When the client accepts multiple encodings, cpp-httplib picks the one with the highest q-value in `Accept-Encoding`. On a tie the order is Brotli → gzip → Zstd (among those enabled at build time).
 
 ## Streaming responses are compressed too
 
@@ -47,6 +47,14 @@ svr.Get("/events", [](const httplib::Request &req, httplib::Response &res) {
     });
 });
 ```
+
+## Turning it off
+
+```cpp
+svr.set_compress(false);
+```
+
+Handler responses, buffered or streamed, are then sent as they are. Over HTTPS, the length of a compressed response can give away a secret in it, such as a CSRF token, when the same response also carries text an attacker can choose (the BREACH attack). Static file compression is set separately.
 
 ## Static files need to be opted in
 

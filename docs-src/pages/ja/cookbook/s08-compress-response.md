@@ -32,7 +32,7 @@ svr.Get("/api/data", [](const httplib::Request &req, httplib::Response &res) {
 
 ## 圧縮の優先順位
 
-クライアントが複数の方式を受け入れる場合、Brotli → Zstd → gzipの順に選ばれます（ビルドで有効になっている中から）。クライアント側では気にせず、一番効率の良い方式で圧縮されます。
+クライアントが複数の方式を受け入れる場合は、`Accept-Encoding`のq値がいちばん高い方式で圧縮します。q値が同じときは、ビルドで有効な方式の中からBrotli → gzip → Zstdの順に選びます。
 
 ## ストリーミングレスポンスも圧縮される
 
@@ -47,6 +47,14 @@ svr.Get("/events", [](const httplib::Request &req, httplib::Response &res) {
     });
 });
 ```
+
+## 圧縮を止める
+
+```cpp
+svr.set_compress(false);
+```
+
+ハンドラのレスポンスは、通常のボディもストリーミングも、そのまま送られます。HTTPSでは、攻撃者が選べる文字列とCSRFトークンなどの秘密が同じレスポンスに載ると、圧縮後の長さから秘密が漏れることがあります（BREACH攻撃）。静的ファイルの圧縮は別に設定します。
 
 ## 静的ファイルは明示的に有効にする
 
@@ -69,7 +77,7 @@ svr.set_static_file_compression_max_length(1024 * 1024);
 
 どちらの境界も`0`で無効にできます。コンパイル時のデフォルトは`CPPHTTPLIB_STATIC_FILE_COMPRESSION_MIN_LENGTH`と`CPPHTTPLIB_STATIC_FILE_COMPRESSION_MAX_LENGTH`で決まります。
 
-圧縮しても`Content-Length`は付いたままなので、`HEAD`は`GET`と同じサイズを返します。細かい挙動として、Rangeリクエストは非圧縮の表現から切り出して返し、`ETag`には`W/"...-gzip"`のように使われた圧縮方式が入ります。
+圧縮しても`Content-Length`は付いたままなので、`HEAD`は`GET`と同じサイズを返します。細かい点が2つあります。Rangeリクエストには圧縮前のデータから該当範囲を切り出して返します。また、`ETag`には`W/"...-gzip"`のように、使った圧縮方式が入ります。
 
 なお`set_content_provider()`で登録したコンテンツプロバイダは対象外です。圧縮器を通すと、内部バッファが埋まるまで書き込みが送出されず、ボディを少しずつ生成するプロバイダが止まってしまうためです。生成したボディを圧縮したい場合は`set_chunked_content_provider()`を使ってください。
 
