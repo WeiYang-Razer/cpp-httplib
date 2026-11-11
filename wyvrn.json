@@ -1,10 +1,10 @@
 {
   "name": "cpp-httplib",
-  "version": "0.0.0.2",
+  "version": "0.66.0.0",
   "schemaVersion": 2,
   "kind": "HeaderOnlyLib",
   "cmakePackageName": "httplib",
-  "description": "TODO: one-line description of cpp-httplib",
+  "description": "C++11 single-file header-only cross platform HTTP/HTTPS server and client library",
   "dependencies": {},
   "build": {
     "system": "cmake",
